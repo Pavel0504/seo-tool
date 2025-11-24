@@ -21,11 +21,11 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    const { site_url, urls_json_url } = await req.json();
+    const { site_url, sitemap_xml_url } = await req.json();
 
-    if (!site_url || !urls_json_url) {
+    if (!site_url || !sitemap_xml_url) {
       return new Response(
-        JSON.stringify({ error: "site_url and urls_json_url are required" }),
+        JSON.stringify({ error: "site_url and sitemap_xml_url are required" }),
         {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -33,12 +33,14 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const urlsResponse = await fetch(urls_json_url);
-    if (!urlsResponse.ok) {
-      throw new Error(`Failed to fetch URLs: ${urlsResponse.statusText}`);
+    const sitemapResponse = await fetch(sitemap_xml_url);
+    if (!sitemapResponse.ok) {
+      throw new Error(`Failed to fetch sitemap: ${sitemapResponse.statusText}`);
     }
 
-    const urlsData = await urlsResponse.json();
+    const sitemapXml = await sitemapResponse.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(sitemapXml, "text/xml");
 
     await supabase.from("stored_sitemaps").delete().eq("site_url", site_url);
 
@@ -51,25 +53,69 @@ Deno.serve(async (req: Request) => {
       changefreq?: string;
     }> = [];
 
-    if (urlsData.urls) {
-      for (const [category, items] of Object.entries(urlsData.urls)) {
-        if (Array.isArray(items)) {
-          for (const item of items) {
-            const url = typeof item === "string" ? item : item.url;
-            const date_modified = typeof item === "object" ? item.date_modified : null;
+    const sitemapIndexUrls = doc.querySelectorAll("sitemapindex > sitemap > loc");
 
-            if (url) {
-              sitemapEntries.push({
-                site_url,
-                category: category as string,
-                url,
-                lastmod: date_modified || new Date().toISOString().split('T')[0],
-                priority: category === "products" ? "0.8" : "0.6",
-                changefreq: category === "products" ? "daily" : "weekly",
-              });
-            }
+    if (sitemapIndexUrls.length > 0) {
+      for (const locElement of sitemapIndexUrls) {
+        const childSitemapUrl = locElement.textContent;
+        if (!childSitemapUrl) continue;
+
+        try {
+          const childResponse = await fetch(childSitemapUrl);
+          if (!childResponse.ok) continue;
+
+          const childXml = await childResponse.text();
+          const childDoc = parser.parseFromString(childXml, "text/xml");
+          const urlElements = childDoc.querySelectorAll("url > loc");
+
+          let category = "other";
+          if (childSitemapUrl.includes("products")) category = "products";
+          else if (childSitemapUrl.includes("categories")) category = "categories";
+          else if (childSitemapUrl.includes("brands") || childSitemapUrl.includes("manufacturers")) category = "manufacturers";
+          else if (childSitemapUrl.includes("info")) category = "information";
+
+          for (const urlEl of urlElements) {
+            const url = urlEl.textContent;
+            if (!url) continue;
+
+            const parent = urlEl.parentElement;
+            const lastmod = parent?.querySelector("lastmod")?.textContent || null;
+            const priority = parent?.querySelector("priority")?.textContent || "0.5";
+            const changefreq = parent?.querySelector("changefreq")?.textContent || "weekly";
+
+            sitemapEntries.push({
+              site_url,
+              category,
+              url,
+              lastmod: lastmod || new Date().toISOString().split('T')[0],
+              priority,
+              changefreq,
+            });
           }
+        } catch (err) {
+          console.error(`Error processing child sitemap ${childSitemapUrl}:`, err);
         }
+      }
+    } else {
+      const urlElements = doc.querySelectorAll("url > loc");
+
+      for (const urlEl of urlElements) {
+        const url = urlEl.textContent;
+        if (!url) continue;
+
+        const parent = urlEl.parentElement;
+        const lastmod = parent?.querySelector("lastmod")?.textContent || null;
+        const priority = parent?.querySelector("priority")?.textContent || "0.5";
+        const changefreq = parent?.querySelector("changefreq")?.textContent || "weekly";
+
+        sitemapEntries.push({
+          site_url,
+          category: "other",
+          url,
+          lastmod: lastmod || new Date().toISOString().split('T')[0],
+          priority,
+          changefreq,
+        });
       }
     }
 

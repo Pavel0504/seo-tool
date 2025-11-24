@@ -20,6 +20,8 @@ export default function SitemapViewer() {
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(0);
+  const ITEMS_PER_PAGE = 100;
   const SITE_URL = 'https://atlantpro24.ru';
 
   useEffect(() => {
@@ -62,7 +64,7 @@ export default function SitemapViewer() {
         },
         body: JSON.stringify({
           site_url: SITE_URL,
-          urls_json_url: `${SITE_URL}/urls.json`,
+          sitemap_xml_url: `${SITE_URL}/sitemap.xml`,
         }),
       });
 
@@ -86,6 +88,13 @@ export default function SitemapViewer() {
     const matchesSearch = searchQuery === '' || item.url.toLowerCase().includes(searchQuery.toLowerCase());
     return matchesCategory && matchesSearch;
   });
+
+  const totalPages = Math.ceil(filteredData.length / ITEMS_PER_PAGE);
+  const paginatedData = filteredData.slice(currentPage * ITEMS_PER_PAGE, (currentPage + 1) * ITEMS_PER_PAGE);
+
+  useEffect(() => {
+    setCurrentPage(0);
+  }, [activeCategory, searchQuery]);
 
   const stats = {
     total: sitemapData.length,
@@ -211,7 +220,7 @@ export default function SitemapViewer() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
-              {filteredData.slice(0, 100).map((item) => (
+              {paginatedData.map((item) => (
                 <tr key={item.id} className="hover:bg-gray-700/50 transition-colors">
                   <td className="px-6 py-4 text-sm text-gray-300 capitalize">{item.category}</td>
                   <td className="px-6 py-4 text-sm">
@@ -236,9 +245,25 @@ export default function SitemapViewer() {
               Нет данных для отображения
             </div>
           )}
-          {filteredData.length > 100 && (
-            <div className="px-6 py-4 text-center text-sm text-gray-400 border-t border-gray-700">
-              Показано 100 из {filteredData.length} URL. Используйте фильтры для уточнения.
+          {totalPages > 1 && (
+            <div className="flex items-center justify-center space-x-2 py-4 border-t border-gray-700">
+              <button
+                onClick={() => setCurrentPage(Math.max(0, currentPage - 1))}
+                disabled={currentPage === 0}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded-lg transition-colors"
+              >
+                Назад
+              </button>
+              <div className="text-gray-400">
+                Страница {currentPage + 1} из {totalPages}
+              </div>
+              <button
+                onClick={() => setCurrentPage(Math.min(totalPages - 1, currentPage + 1))}
+                disabled={currentPage === totalPages - 1}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded-lg transition-colors"
+              >
+                Далее
+              </button>
             </div>
           )}
         </div>

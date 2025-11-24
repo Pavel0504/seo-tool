@@ -313,107 +313,180 @@ export default function NewAudit() {
 
       if (auditError) throw auditError;
 
-      let allUrls: Set<string> = new Set();
-
-      setProgress('Загрузка списка URL...');
+      setProgress('Загрузка списка URL из JSON...');
       setProgressPercent(5);
 
-      try {
-        const proxyResponse = await fetchViaProxy(urlsJsonUrl);
-        if (proxyResponse.status === 200) {
-          const parsed = typeof proxyResponse.data === 'string'
-            ? JSON.parse(proxyResponse.data)
-            : proxyResponse.data;
-
-          const extractedUrls = await extractUrlsFromJson(parsed.urls || parsed);
-          extractedUrls.forEach(url => allUrls.add(url));
-
-          for (const url of extractedUrls) {
-            await supabase.from('found_urls').upsert({
-              audit_id: audit.id,
-              url: url,
-              source: 'json_list'
-            }, { onConflict: 'audit_id,url' });
-          }
-        }
-      } catch (err) {
-        console.error('Error fetching URLs:', err);
+      const proxyResponse = await fetchViaProxy(urlsJsonUrl);
+      if (proxyResponse.status !== 200) {
+        throw new Error('Не удалось загрузить URLs');
       }
 
-      setProgress('Загрузка и анализ sitemap...');
-      setProgressPercent(10);
+      const parsed = typeof proxyResponse.data === 'string'
+        ? JSON.parse(proxyResponse.data)
+        : proxyResponse.data;
 
-      const sitemapUrl = `${siteUrl}/sitemap.xml`;
-      try {
-        const parser = new DOMParser();
-        const proxyResponse = await fetchViaProxy(sitemapUrl);
-        const sitemapXml = typeof proxyResponse.data === 'string'
-          ? proxyResponse.data
-          : String(proxyResponse.data);
-        const xmlDoc = parser.parseFromString(sitemapXml, 'text/xml');
-
-        const sitemapIndexUrls = xmlDoc.querySelectorAll('sitemapindex > sitemap > loc');
-
-        if (sitemapIndexUrls.length > 0) {
-          setProgress(`Обнаружен sitemap index с ${sitemapIndexUrls.length} файлами...`);
-          await processSitemapIndex(sitemapUrl, audit.id);
-        } else {
-          await processSingleSitemap(sitemapUrl, audit.id);
-        }
-
-        const { data: sitemapData } = await supabase
-          .from('sitemap_urls')
-          .select('url')
-          .eq('audit_id', audit.id);
-
-        if (sitemapData) {
-          setProgress(`Добавлено ${sitemapData.length} URL из sitemap`);
-          sitemapData.forEach(item => allUrls.add(item.url));
-          for (const item of sitemapData) {
-            await supabase.from('found_urls').upsert({
-              audit_id: audit.id,
-              url: item.url,
-              source: 'sitemap'
-            }, { onConflict: 'audit_id,url' });
-          }
-        }
-      } catch (err) {
-        console.error('Error analyzing sitemap:', err);
-      }
-
-      const urlsArray = Array.from(allUrls);
-      const totalUrls = urlsArray.length;
+      const extractedUrls = await extractUrlsFromJson(parsed.urls || parsed);
+      const totalUrls = extractedUrls.length;
 
       await supabase
         .from('audits')
         .update({
           total_found_urls: totalUrls,
-          total_urls: Math.min(totalUrls, 100)
+          total_urls: totalUrls
         })
         .eq('id', audit.id);
 
-      setProgress(`Начало сканирования ${totalUrls} URL по 100 за раз...`);
-      setProgressPercent(20);
+      setProgress(`Загрузка данных sitemap и robots из БД...`);
+      setProgressPercent(10);
+
+      const { data: sitemapData } = await supabase
+        .from('stored_sitemaps')
+        .select('url')
+        .eq('site_url', siteUrl);
+
+      const sitemapSet = new Set((sitemapData || []).map(item => item.url));
+
+      const { data: robotsData } = await supabase
+        .from('stored_robots')
+        .select('content')
+        .eq('site_url', siteUrl)
+        .maybeSingle();
+
+      const robotsDisallowed: string[] = [];
+      if (robotsData?.content) {
+        const lines = robotsData.content.split('\n');
+        for (const line of lines) {
+          if (line.trim().toLowerCase().startsWith('disallow:')) {
+            const path = line.split(':')[1]?.trim();
+            if (path) robotsDisallowed.push(path);
+          }
+        }
+      }
+
+      setProgress(`Начало сканирования ${totalUrls} URL в 2 потока по 100...`);
+      setProgressPercent(15);
 
       const BATCH_SIZE = 100;
-      const totalBatches = Math.ceil(totalUrls / BATCH_SIZE);
+      const THREADS = 2;
+      const urlsArray = extractedUrls;
+      let urlIndex = 0;
+      let completed = 0;
 
-      for (let batchNum = 0; batchNum < totalBatches; batchNum++) {
-        const start = batchNum * BATCH_SIZE;
-        const end = Math.min(start + BATCH_SIZE, totalUrls);
-        const batchUrls = urlsArray.slice(start, end);
+      async function processUrlWithDelay(url: string) {
+        try {
+          const crawlResult = await crawlUrl(url);
+          const issues = analyzeSeoIssues(crawlResult);
 
-        const percent = 20 + Math.floor((batchNum / totalBatches) * 70);
-        setProgressPercent(percent);
-        setProgress(`Сканирование пакета ${batchNum + 1}/${totalBatches} (${batchUrls.length} URL)`);
+          const inSitemap = sitemapSet.has(url);
+          const urlPath = new URL(url).pathname;
+          let robotsAllowed = true;
+          for (const rule of robotsDisallowed) {
+            if (urlPath.startsWith(rule)) {
+              robotsAllowed = false;
+              break;
+            }
+          }
 
-        await processUrlBatch(batchUrls, batchNum + 1, totalBatches, audit.id);
+          const sitemapRobotsIssues: string[] = [];
+          if (!inSitemap) sitemapRobotsIssues.push('Не найдено в sitemap');
+          if (!robotsAllowed) sitemapRobotsIssues.push('Заблокировано в robots.txt');
+          if (crawlResult.hasNoindex && inSitemap) sitemapRobotsIssues.push('В sitemap, но есть noindex');
+          if (crawlResult.status === 404 && inSitemap) sitemapRobotsIssues.push('В sitemap, но 404 ошибка');
 
-        await supabase
-          .from('audits')
-          .update({ urls_checked: end })
-          .eq('id', audit.id);
+          const { data: urlCheck, error: urlError } = await supabase
+            .from('url_checks')
+            .insert({
+              audit_id: audit.id,
+              url: crawlResult.url,
+              http_status: crawlResult.status,
+              redirect_chain: crawlResult.redirectChain,
+              response_time: crawlResult.responseTime,
+              title: crawlResult.title,
+              title_length: crawlResult.title?.length || 0,
+              meta_description: crawlResult.metaDescription,
+              meta_description_length: crawlResult.metaDescription?.length || 0,
+              h1_tags: crawlResult.h1Tags,
+              h1_count: crawlResult.h1Tags.length,
+              canonical_url: crawlResult.canonicalUrl,
+              robots_meta: crawlResult.robotsMeta,
+              has_noindex: crawlResult.hasNoindex,
+              has_nofollow: crawlResult.hasNofollow,
+              images_without_alt: crawlResult.imagesWithoutAlt,
+              broken_images: crawlResult.brokenImages,
+              content_length: crawlResult.contentLength,
+              internal_links: crawlResult.internalLinks,
+              external_links: crawlResult.externalLinks,
+              broken_links: crawlResult.brokenLinks,
+              has_https: crawlResult.hasHttps,
+              mixed_content: crawlResult.mixedContent,
+              in_sitemap: inSitemap,
+              robots_allowed: robotsAllowed,
+              sitemap_robots_issues: sitemapRobotsIssues.length > 0 ? sitemapRobotsIssues.join('; ') : null
+            })
+            .select()
+            .single();
+
+          if (urlError) throw urlError;
+
+          if (sitemapRobotsIssues.length > 0) {
+            issues.push({
+              type: 'sitemap_robots',
+              severity: 'high',
+              code: 'sitemap_robots_issue',
+              description: sitemapRobotsIssues.join('; '),
+              recommendation: 'Исправьте проблемы с sitemap/robots для улучшения индексации'
+            });
+          }
+
+          if (issues.length > 0) {
+            const issueInserts = issues.map(issue => ({
+              audit_id: audit.id,
+              url_check_id: urlCheck.id,
+              issue_type: issue.type,
+              severity: issue.severity,
+              issue_code: issue.code,
+              description: issue.description,
+              recommendation: issue.recommendation
+            }));
+
+            await supabase.from('seo_issues').insert(issueInserts);
+          }
+
+          completed++;
+          const percent = 15 + Math.floor((completed / totalUrls) * 80);
+          setProgressPercent(percent);
+          setProgress(`Сканировано ${completed}/${totalUrls} URL`);
+
+          await supabase
+            .from('audits')
+            .update({ urls_checked: completed })
+            .eq('id', audit.id);
+        } catch (err) {
+          console.error(`Error processing ${url}:`, err);
+        }
       }
+
+      async function processThread() {
+        while (urlIndex < urlsArray.length) {
+          const batchStart = urlIndex;
+          const batchEnd = Math.min(urlIndex + BATCH_SIZE, urlsArray.length);
+          urlIndex = batchEnd;
+
+          const batch = urlsArray.slice(batchStart, batchEnd);
+
+          for (const url of batch) {
+            await processUrlWithDelay(url);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+      }
+
+      const threads = [];
+      for (let i = 0; i < THREADS; i++) {
+        threads.push(processThread());
+      }
+
+      await Promise.all(threads);
 
       await supabase
         .from('audits')

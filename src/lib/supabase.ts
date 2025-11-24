@@ -46,6 +46,9 @@ export type UrlCheck = {
   broken_links: number;
   has_https: boolean;
   mixed_content: boolean;
+  in_sitemap: boolean;
+  robots_allowed: boolean;
+  sitemap_robots_issues?: string;
   checked_at: string;
 };
 

@@ -7,7 +7,7 @@ interface AuditResultsProps {
 }
 
 export default function AuditResults({ auditId }: AuditResultsProps) {
-  const [activeTab, setActiveTab] = useState<'overview' | 'issues' | 'sitemap'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'issues'>('overview');
   const [urlChecks, setUrlChecks] = useState<UrlCheck[]>([]);
   const [seoIssues, setSeoIssues] = useState<SeoIssue[]>([]);
   const [sitemapUrls, setSitemapUrls] = useState<any[]>([]);
@@ -135,6 +135,41 @@ export default function AuditResults({ auditId }: AuditResultsProps) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold text-gray-100">Результаты аудита</h1>
+        <button
+          onClick={() => {
+            const errors = seoIssues.filter(i => i.severity !== 'success');
+            const csv = [
+              ['URL', 'Критичность', 'Тип', 'Код', 'Описание', 'Рекомендация', 'HTTP Статус', 'В Sitemap', 'Robots Разрешено', 'Проблемы Sitemap/Robots'].join(','),
+              ...errors.map(issue => {
+                const urlCheck = urlChecks.find(u => u.id === issue.url_check_id);
+                return [
+                  `"${(urlCheck?.url || '').replace(/"/g, '""')}"`,
+                  issue.severity,
+                  issue.issue_type,
+                  issue.issue_code,
+                  `"${issue.description.replace(/"/g, '""')}"`,
+                  `"${(issue.recommendation || '').replace(/"/g, '""')}"`,
+                  urlCheck?.http_status || '',
+                  urlCheck?.in_sitemap ? 'Да' : 'Нет',
+                  urlCheck?.robots_allowed ? 'Да' : 'Нет',
+                  `"${(urlCheck?.sitemap_robots_issues || '').replace(/"/g, '""')}"`
+                ].join(',');
+              })
+            ].join('\\n');
+
+            const blob = new Blob(['\\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `seo-errors-${new Date().toISOString().split('T')[0]}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+          }}
+          className="flex items-center space-x-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+        >
+          <Download className="w-4 h-4" />
+          <span>Экспорт ошибок CSV</span>
+        </button>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
@@ -169,8 +204,7 @@ export default function AuditResults({ auditId }: AuditResultsProps) {
           <nav className="flex space-x-8 px-6" aria-label="Tabs">
             {[
               { id: 'overview', label: 'Обзор' },
-              { id: 'issues', label: 'Проблемы', count: totalIssues },
-              { id: 'sitemap', label: 'Sitemap', count: sitemapUrls.length }
+              { id: 'issues', label: 'Проблемы', count: totalIssues }
             ].map((tab) => (
               <button
                 key={tab.id}
@@ -352,7 +386,25 @@ export default function AuditResults({ auditId }: AuditResultsProps) {
                                 {url.content_length}
                               </span>
                             </div>
+                            <div className="bg-gray-800 rounded px-2 py-1">
+                              <span className="text-gray-400">В Sitemap:</span>
+                              <span className={`ml-2 font-semibold ${url.in_sitemap ? 'text-green-400' : 'text-orange-400'}`}>
+                                {url.in_sitemap ? 'Да' : 'Нет'}
+                              </span>
+                            </div>
+                            <div className="bg-gray-800 rounded px-2 py-1">
+                              <span className="text-gray-400">Robots разрешено:</span>
+                              <span className={`ml-2 font-semibold ${url.robots_allowed ? 'text-green-400' : 'text-orange-400'}`}>
+                                {url.robots_allowed ? 'Да' : 'Нет'}
+                              </span>
+                            </div>
                           </div>
+                          {url.sitemap_robots_issues && (
+                            <div className="bg-orange-900/30 border border-orange-700 rounded px-3 py-2 mt-2">
+                              <div className="text-xs font-semibold text-orange-400 mb-1">Проблемы Sitemap/Robots</div>
+                              <div className="text-xs text-orange-300">{url.sitemap_robots_issues}</div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -506,93 +558,6 @@ export default function AuditResults({ auditId }: AuditResultsProps) {
             </div>
           )}
 
-          {activeTab === 'sitemap' && (
-            <div className="space-y-2">
-              {sitemapToDisplay.map((item) => (
-                <div
-                  key={item.id}
-                  className={`border rounded-lg ${getStatusBgColor(200)} transition-all`}
-                >
-                  <button
-                    onClick={() => setExpandedUrl(expandedUrl === item.id ? null : item.id)}
-                    className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-800/50 transition-colors"
-                  >
-                    <div className="flex items-center space-x-3 flex-1 min-w-0">
-                      <ChevronDown
-                        className={`w-5 h-5 flex-shrink-0 transition-transform ${
-                          expandedUrl === item.id ? 'transform rotate-180' : ''
-                        }`}
-                      />
-                      <a
-                        href={item.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-400 hover:text-blue-300 truncate flex-1 text-left"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {item.url}
-                      </a>
-                    </div>
-                  </button>
-
-                  {expandedUrl === item.id && (
-                    <div className="border-t border-gray-700 px-4 py-3 bg-gray-900/50 space-y-3 text-sm">
-                      <div>
-                        <span className="text-gray-400">Файл sitemap:</span>
-                        <span className="ml-2 text-gray-300">{item.sitemap_url}</span>
-                      </div>
-                      {item.lastmod && (
-                        <div>
-                          <span className="text-gray-400">Последнее изменение:</span>
-                          <span className="ml-2 text-gray-300">{item.lastmod}</span>
-                        </div>
-                      )}
-                      {item.priority && (
-                        <div>
-                          <span className="text-gray-400">Приоритет:</span>
-                          <span className="ml-2 text-gray-300">{item.priority}</span>
-                        </div>
-                      )}
-                      {item.changefreq && (
-                        <div>
-                          <span className="text-gray-400">Частота изменений:</span>
-                          <span className="ml-2 text-gray-300">{item.changefreq}</span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {sitemapUrls.length === 0 && (
-                <div className="text-center py-8 text-gray-400">
-                  Sitemap не найден или не проанализирован
-                </div>
-              )}
-
-              {totalSitemapPages > 1 && (
-                <div className="flex items-center justify-center space-x-2 mt-6">
-                  <button
-                    onClick={() => setSitemapPage(Math.max(0, sitemapPage - 1))}
-                    disabled={sitemapPage === 0}
-                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded-lg transition-colors"
-                  >
-                    Назад
-                  </button>
-                  <div className="text-gray-400">
-                    Страница {sitemapPage + 1} из {totalSitemapPages}
-                  </div>
-                  <button
-                    onClick={() => setSitemapPage(Math.min(totalSitemapPages - 1, sitemapPage + 1))}
-                    disabled={sitemapPage === totalSitemapPages - 1}
-                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:opacity-50 text-gray-200 rounded-lg transition-colors"
-                  >
-                    Далее
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       </div>
     </div>
