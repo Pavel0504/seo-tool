@@ -7,8 +7,6 @@ import { fetchViaProxy } from '../lib/fetchProxy';
 export default function NewAudit() {
   const [siteUrl, setSiteUrl] = useState('https://atlantpro24.ru');
   const [urlsJsonUrl, setUrlsJsonUrl] = useState('https://atlantpro24.ru/urls.json');
-  const [robotsTxtUrl, setRobotsTxtUrl] = useState('https://atlantpro24.ru/robots.txt');
-  const [sitemapUrl, setSitemapUrl] = useState('https://atlantpro24.ru/sitemap.xml');
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState('');
   const [progressPercent, setProgressPercent] = useState(0);
@@ -56,25 +54,6 @@ export default function NewAudit() {
     }
   }
 
-  async function fetchRobotsTxt() {
-    setLoading(true);
-    setError('');
-    setProgress('Загрузка robots.txt...');
-
-    try {
-      const proxyResponse = await fetchViaProxy(robotsTxtUrl);
-      if (proxyResponse.status === 200) {
-        setProgress('robots.txt загружен');
-        setTimeout(() => setProgress(''), 2000);
-      } else {
-        setError('Не удалось загрузить robots.txt');
-      }
-    } catch (err) {
-      setError('Ошибка загрузки robots.txt');
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function extractUrlsFromJson(obj: any): Promise<string[]> {
     const result: string[] = [];
@@ -132,9 +111,15 @@ export default function NewAudit() {
 
       const sitemapLocs = indexDoc.querySelectorAll('sitemapindex > sitemap > loc');
 
+      setProgress(`Обнаружено ${sitemapLocs.length} sitemap файлов...`);
+
+      let processedSitemaps = 0;
       for (const loc of sitemapLocs) {
         const sitemapUrl = loc.textContent;
         if (sitemapUrl) {
+          processedSitemaps++;
+          setProgress(`Обработка sitemap ${processedSitemaps}/${sitemapLocs.length}...`);
+
           try {
             const sitemapResponse = await fetchViaProxy(sitemapUrl);
             const sitemapXml = typeof sitemapResponse.data === 'string'
@@ -161,13 +146,21 @@ export default function NewAudit() {
             }
 
             if (urlsToInsert.length > 0) {
-              await supabase.from('sitemap_urls').insert(urlsToInsert);
+              const BATCH_SIZE = 1000;
+              for (let i = 0; i < urlsToInsert.length; i += BATCH_SIZE) {
+                const batch = urlsToInsert.slice(i, i + BATCH_SIZE);
+                await supabase.from('sitemap_urls').insert(batch);
+              }
             }
+
+            await new Promise(resolve => setTimeout(resolve, 100));
           } catch (err) {
             console.error(`Error processing sitemap ${sitemapUrl}:`, err);
           }
         }
       }
+
+      setProgress(`Загружено ${sitemapUrls.size} URL из sitemap`);
     } catch (err) {
       console.error('Error processing sitemap index:', err);
     }
@@ -219,9 +212,22 @@ export default function NewAudit() {
           const crawlResult = await crawlUrl(urlToCrawl);
           const issues = analyzeSeoIssues(crawlResult);
 
+          const { data: existingCheck } = await supabase
+            .from('url_checks')
+            .select('id')
+            .eq('audit_id', auditId)
+            .eq('url', crawlResult.url)
+            .maybeSingle();
+
+          if (existingCheck) {
+            success = true;
+            retries = 0;
+            continue;
+          }
+
           const { data: urlCheck, error: urlError } = await supabase
             .from('url_checks')
-            .upsert({
+            .insert({
               audit_id: auditId,
               url: crawlResult.url,
               http_status: crawlResult.status,
@@ -245,7 +251,7 @@ export default function NewAudit() {
               broken_links: crawlResult.brokenLinks,
               has_https: crawlResult.hasHttps,
               mixed_content: crawlResult.mixedContent
-            }, { onConflict: 'audit_id,url' })
+            })
             .select()
             .single();
 
@@ -334,67 +340,45 @@ export default function NewAudit() {
         console.error('Error fetching URLs:', err);
       }
 
-      setProgress('Анализ robots.txt...');
+      setProgress('Загрузка и анализ sitemap...');
       setProgressPercent(10);
 
+      const sitemapUrl = `${siteUrl}/sitemap.xml`;
       try {
-        const proxyResponse = await fetchViaProxy(robotsTxtUrl);
-        if (proxyResponse.status === 200) {
-          const robotsTxt = typeof proxyResponse.data === 'string'
-            ? proxyResponse.data
-            : String(proxyResponse.data);
-          const robotsAnalysis = parseRobotsTxt(robotsTxt);
-          await supabase.from('robots_txt_analysis').insert({
-            audit_id: audit.id,
-            content: robotsTxt,
-            has_errors: robotsAnalysis.hasErrors,
-            errors: robotsAnalysis.errors,
-            blocked_important_paths: robotsAnalysis.blockedPaths,
-            recommendations: robotsAnalysis.recommendations
-          });
+        const parser = new DOMParser();
+        const proxyResponse = await fetchViaProxy(sitemapUrl);
+        const sitemapXml = typeof proxyResponse.data === 'string'
+          ? proxyResponse.data
+          : String(proxyResponse.data);
+        const xmlDoc = parser.parseFromString(sitemapXml, 'text/xml');
+
+        const sitemapIndexUrls = xmlDoc.querySelectorAll('sitemapindex > sitemap > loc');
+
+        if (sitemapIndexUrls.length > 0) {
+          setProgress(`Обнаружен sitemap index с ${sitemapIndexUrls.length} файлами...`);
+          await processSitemapIndex(sitemapUrl, audit.id);
+        } else {
+          await processSingleSitemap(sitemapUrl, audit.id);
+        }
+
+        const { data: sitemapData } = await supabase
+          .from('sitemap_urls')
+          .select('url')
+          .eq('audit_id', audit.id);
+
+        if (sitemapData) {
+          setProgress(`Добавлено ${sitemapData.length} URL из sitemap`);
+          sitemapData.forEach(item => allUrls.add(item.url));
+          for (const item of sitemapData) {
+            await supabase.from('found_urls').upsert({
+              audit_id: audit.id,
+              url: item.url,
+              source: 'sitemap'
+            }, { onConflict: 'audit_id,url' });
+          }
         }
       } catch (err) {
-        console.error('Error analyzing robots.txt:', err);
-      }
-
-      if (sitemapUrl) {
-        setProgress('Анализ sitemap...');
-        setProgressPercent(15);
-        try {
-          const parser = new DOMParser();
-          const proxyResponse = await fetchViaProxy(sitemapUrl);
-          const sitemapXml = typeof proxyResponse.data === 'string'
-            ? proxyResponse.data
-            : String(proxyResponse.data);
-          const xmlDoc = parser.parseFromString(sitemapXml, 'text/xml');
-
-          const sitemapIndexUrls = xmlDoc.querySelectorAll('sitemapindex > sitemap > loc');
-
-          if (sitemapIndexUrls.length > 0) {
-            setProgress(`Обнаружен sitemap index с ${sitemapIndexUrls.length} файлами...`);
-            await processSitemapIndex(sitemapUrl, audit.id);
-          } else {
-            await processSingleSitemap(sitemapUrl, audit.id);
-          }
-
-          const { data: sitemapData } = await supabase
-            .from('sitemap_urls')
-            .select('url')
-            .eq('audit_id', audit.id);
-
-          if (sitemapData) {
-            sitemapData.forEach(item => allUrls.add(item.url));
-            for (const item of sitemapData) {
-              await supabase.from('found_urls').upsert({
-                audit_id: audit.id,
-                url: item.url,
-                source: 'sitemap'
-              }, { onConflict: 'audit_id,url' });
-            }
-          }
-        } catch (err) {
-          console.error('Error analyzing sitemap:', err);
-        }
+        console.error('Error analyzing sitemap:', err);
       }
 
       const urlsArray = Array.from(allUrls);
@@ -503,41 +487,6 @@ export default function NewAudit() {
             )}
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Ссылка на robots.txt
-            </label>
-            <div className="flex items-center space-x-2">
-              <input
-                type="text"
-                value={robotsTxtUrl}
-                onChange={(e) => setRobotsTxtUrl(e.target.value)}
-                className="flex-1 px-4 py-2 bg-gray-900 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-100"
-                placeholder="https://atlantpro24.ru/robots.txt"
-              />
-              <button
-                onClick={fetchRobotsTxt}
-                disabled={loading}
-                className="flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
-              >
-                <Download className="w-4 h-4" />
-                <span>Проверить</span>
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              URL Sitemap (необязательно)
-            </label>
-            <input
-              type="text"
-              value={sitemapUrl}
-              onChange={(e) => setSitemapUrl(e.target.value)}
-              className="w-full px-4 py-2 bg-gray-900 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-100"
-              placeholder="https://example.com/sitemap.xml"
-            />
-          </div>
 
           {error && (
             <div className="flex items-center space-x-2 p-4 bg-red-900/50 border border-red-600 rounded-lg text-red-200">
